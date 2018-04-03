@@ -1,0 +1,1327 @@
+---
+title: "Kaggle AmesHousing"
+author: "Vilhelm Stiernstedt"
+date: "18/02/2018"
+output: html_document
+---
+
+```{r Libraries, echo=FALSE, warning=FALSE, message=FALSE}
+library(data.table)
+library(ggplot2)
+library(moments)
+library(dplyr)
+library(plyr)
+library(glmnet)
+library(caret)
+library(car)
+library(corrplot)
+library(Hmisc)
+library(shiny)
+dyn.load('/Library/Java/JavaVirtualMachines/jdk-9.0.1.jdk/Contents/Home/lib/server/libjvm.dylib')
+library(rJava)
+library(FSelector)
+library(prettyR)
+library(gridExtra)
+library(outliers)
+```
+
+
+## Dataset Introduction
+The experimental dataset used is the Ames House Price Dataset. It includes 79 explanatory variables of residential homes. For more details on the dataset and the competition see <https://www.kaggle.com/c/house-prices-advanced-regression-techniques>.
+
+## Project Goal
+- Predict the final price of each home with the lowest RMSE score possible by novel feature engineering and general linear regression models inc. Ridge, Lasso and ElasticNet model techniques. 
+
+## Data Ingestion & Cleaning
+In this section we will ingest, inspect and clean data. Cleaning process includes:
+1) Dropping uninformative features  
+2) Refactorize known features
+3) Dropping low level features
+4) NA imputation -> by using data description notes, data analysis and LM for prediction.
+
+```{r Data Ingestion & Cleaning}
+### Data Ingestion ----
+
+### Data Ingestion
+dt_train <- data.table(read.csv("train.csv"))
+dt_test <- data.table(read.csv("test.csv"))
+
+# ---- Initial Data Inspection ----
+### Columns same for Test and Train data
+colnames(dt_train)
+colnames(dt_test) # test data missing SalePrice as assumed
+length(dt_train$Id) == nrow(dt_train) # all rows unique Id thuis no duplicates and Id can be dropped
+
+### Drop Columns
+dt_train$Id <- NULL
+
+# Merge test and training data
+dt_All <- rbind(dt_train[, !"SalePrice"], dt_test[, !"Id"])
+
+# ---- Variable Identification ----
+table(sapply(dt_train, class))
+table(sapply(dt_test, class))
+
+# ---- Refactorize Known Features ----
+### Change class of variables
+# MSSubClass: The building class -> not numerical -> factor
+dt_train[, MSSubClass := as.factor(MSSubClass)]
+dt_test[, MSSubClass := as.factor(MSSubClass)]
+
+# MoSold: Month Sold -> not numerical -> factor
+dt_train[, MoSold := as.factor(MoSold)]
+dt_test[, MoSold := as.factor(MoSold)]
+
+# --- Factor Level Anlysis ----
+### Get Factor variables from training split
+train_factor_columns <- names(which(sapply(dt_train, is.factor)))
+test_factor_columns <- names(which(sapply(dt_test, is.factor)))
+### Show number of factor levels per variable
+sort(sapply(lapply(dt_train[, train_factor_columns, with = F], droplevels), nlevels), decreasing = F)
+sort(sapply(lapply(dt_test[, test_factor_columns, with = F], droplevels), nlevels), decreasing = F)
+
+### Utilites -> remove all properties that doesn't have all public utilities -> only one reaming -> drop feature
+dt_train$Utilities <- NULL
+dt_test$Utilities <- NULL
+
+# --- Inspection of Noteworthy Variables ----
+### MSZoning -> C (meaning commercial) properties?
+summary(dt_train$MSZoning) # 10 commerical properties
+summary(dt_test$MSZoning) # 15 commerical properties
+# Plot relationship with SalePrice
+ggplot(dt_train, aes(x = reorder(MSZoning, SalePrice, FUN = mean), y = SalePrice)) + geom_boxplot() 
+# Mean price by type
+dt_train[, mean(SalePrice), by = MSZoning]
+# Remove or keep? -> Keep, as it might be good regressor for test data. 
+
+
+# ---- Missing Values Treatment ----
+# Count NAs per colums and subset for columns with NAs > 0
+list_NAs <- sapply(dt_train, function(x) sum(is.na(x)))
+list_NAs <- sort(list_NAs[list_NAs > 0], decreasing = T)
+list_NAs
+paste("Number of variables in training data that contains NA: ", ifelse(length(list_NAs)>0, length(list_NAs), 0))
+
+# Save column names
+NA_columns <- names(list_NAs)
+
+# Check NAs for test data
+list_NAs_test <- sapply(dt_test, function(x) sum(is.na(x)))
+list_NAs_test <- sort(list_NAs_test[list_NAs_test > 0], decreasing = T)
+list_NAs_test
+paste("Number of variables in test data that contains NA: ", ifelse(length(list_NAs_test)>0, length(list_NAs_test), 0))
+
+### Treat NAs per variable
+# LotFrontace (Linear feet of street connected to property)
+summary(dt_train$LotFrontage) # -> Predict values based on LotArea, LotShape and neighbourhood
+
+# LotArea: Plot relationship -> Relationship analysis reveal log is optimal.
+ggplot(dt_train, aes(x=log(LotArea), y=log(LotFrontage))) + geom_point() + geom_smooth(method=lm)
+
+# LotShape -> Plot relationship -> IR3 higher mean
+ggplot(dt_train, aes(x = LotShape, y = LotFrontage)) + geom_boxplot()
+summary(dt_train$LotShape)
+summary(dt_test$LotShape)
+
+# LotConfig -> Plot relationship -> CulDSac lower mean
+ggplot(dt_train, aes(x = LotConfig, y = LotFrontage)) + geom_boxplot()
+summary(dt_train$LotConfig)
+summary(dt_test$LotConfig)
+
+# Neighbourhood: -> Mean varies across different hoods -> strong enough to use?
+ggplot(dt_train, aes(x = LotConfig, y = LotFrontage)) + geom_boxplot()
+dt_train[, median(LotFrontage, na.rm = T), by = Neighborhood]
+
+# Build model
+LotFrontage_lm <- lm(data = dt_All, log(LotFrontage) ~ log(LotArea) + LotShape + LotConfig)
+
+# Predict NAs using model -> LotFrontage is integer
+predict_LotFrontage_train <- as.integer(exp(predict(LotFrontage_lm, newdata = dt_train[is.na(LotFrontage), ])))
+predict_LotFrontage_test <- as.integer(exp(predict(LotFrontage_lm, newdata = dt_test[is.na(LotFrontage), ])))
+
+# See distrubution of prediction for traning and test
+hist(predict_LotFrontage_train, breaks = 50)
+hist(predict_LotFrontage_test, breaks = 50)
+
+# Impute NAs for Train and Test data
+dt_train[is.na(LotFrontage), LotFrontage := predict_LotFrontage_train]
+dt_test[is.na(LotFrontage), LotFrontage := predict_LotFrontage_test]
+
+### Alley (alley access)
+summary(dt_train$Alley)
+# -- Notes states NA = No alley access. 
+dt_train[is.na(Alley), Alley := "None"]
+dt_test[is.na(Alley), Alley := "None"]
+
+### MasVnrType (Masonry veneer type)
+summary(dt_train$MasVnrType)
+# -- 4 levels: BrkCmn / BrkFace / Stone / None -> NA probably means None
+dt_train[is.na(MasVnrType), MasVnrType := "None"]
+dt_test[is.na(MasVnrType), MasVnrType := "None"]
+
+### MasVnrArea (Masonry veneer area in square feet)
+summary(dt_train$MasVnrArea)
+# -- If MasVnrType = None, MasVnrArea NAs = 0
+dt_train[is.na(MasVnrArea), MasVnrArea := 0]
+dt_test[is.na(MasVnrArea), MasVnrArea := 0]
+
+### BsmtQual (Evaluates the height of the basement)
+summary(dt_train$BsmtQual)
+# -- Notes states NA = No Basement
+dt_train[is.na(BsmtQual), BsmtQual := "None"]
+dt_test[is.na(BsmtQual), BsmtQual := "None"]
+
+### BsmtCond (Evaluates the general condition of the basement)
+summary(dt_train$BsmtCond)
+# -- Notes states NA = No Basement
+dt_train[is.na(BsmtCond), BsmtCond := "None"]
+dt_test[is.na(BsmtCond), BsmtCond := "None"]
+
+### BsmtExposure (Refers to walkout or garden level walls)
+summary(dt_train$BsmtExposure)
+# -- Notes states NA = No Basement
+dt_train[is.na(BsmtExposure), BsmtExposure := "None"]
+dt_test[is.na(BsmtExposure), BsmtExposure := "None"]
+
+### BsmtFinType1 (Rating of basement finished area)
+summary(dt_train$BsmtFinSF1)
+# -- Notes states NA = No Basement
+dt_train[is.na(BsmtFinType1), BsmtFinType1 := "None"]
+dt_test[is.na(BsmtFinType1), BsmtFinType1 := "None"]
+
+### BsmtFinType2 (Rating of basement finished area (if multiple types))
+summary(dt_train$BsmtFinSF2)
+# -- Notes states NA = No Basement
+dt_train[is.na(BsmtFinType2), BsmtFinType2 := "None"]
+dt_test[is.na(BsmtFinType2), BsmtFinType2 := "None"]
+
+### Electrical (Electrical system)
+summary(dt_train$Electrical)
+# -- 1 NA, categorical mode imputation
+dt_train[is.na(Electrical), Electrical := "SBrkr"]
+dt_test[is.na(Electrical), Electrical := "SBrkr"]
+
+### FireplaceQu (Fireplace quality)
+summary(dt_train$FireplaceQu)
+# -- Notes states NA = No fireplace
+dt_train[is.na(FireplaceQu), FireplaceQu := "None"]
+dt_test[is.na(FireplaceQu), FireplaceQu := "None"]
+
+### GarageType (Garage location)
+summary(dt_train$GarageType)
+# -- Notes states NA = No Garage
+dt_train[is.na(GarageType), GarageType := "None"]
+dt_test[is.na(GarageType), GarageType := "None"]
+
+### GarageYrBlt (Year garage was built)
+summary(dt_train$GarageYrBlt)
+# -- NA probably means no garage, however we assume garage was built same year as house
+dt_train[is.na(GarageYrBlt), GarageYrBlt := YearBuilt]
+dt_test[is.na(GarageYrBlt), GarageYrBlt := YearBuilt]
+
+### GarageFinish (Interior finish of the garage)
+summary(dt_train$GarageFinish)
+# -- Notes states NA = No Garage
+dt_train[is.na(GarageFinish), GarageFinish := "None"]
+dt_test[is.na(GarageFinish), GarageFinish := "None"]
+
+### GarageQual (Garage quality)
+summary(dt_train$GarageQual)
+# -- Notes states NA = No Garage
+dt_train[is.na(GarageQual), GarageQual := "None"]
+dt_test[is.na(GarageQual), GarageQual := "None"]
+
+### GarageCond (Garage quality)
+summary(dt_train$GarageCond)
+# -- Notes states NA = No Garage
+dt_train[is.na(GarageCond), GarageCond := "None"]
+dt_test[is.na(GarageCond), GarageCond := "None"]
+
+### PoolQC (Pool quality)
+summary(dt_train$PoolQC)
+# -- Notes states NA = No Pool. Majoirty NAs -> drop variable?
+dt_train[is.na(PoolQC), PoolQC := "None"]
+dt_test[is.na(PoolQC), PoolQC := "None"]
+
+### Fence (Fence quality)
+summary(dt_train$Fence)
+# -- Notes states NA = No Fence. Majoirty NAs -> drop variable?
+dt_train[is.na(Fence), Fence := "None"]
+dt_test[is.na(Fence), Fence := "None"]
+
+### MiscFeature (Miscellaneous feature not covered in other categories)
+summary(dt_train$MiscFeature)
+# -- Notes states NA = None extra comments. Majoirty NAs -> drop variable?
+dt_train[is.na(MiscFeature), MiscFeature := "None"]
+dt_test[is.na(MiscFeature), MiscFeature := "None"]
+
+
+### Re-check training data NA columns
+list_NAs <- sapply(dt_train, function(x) sum(is.na(x)))
+list_NAs <- sort(list_NAs[list_NAs > 0], decreasing = T)
+list_NAs
+paste("Number of variables in training data that contains NA: ", ifelse(length(list_NAs)>0, length(list_NAs), 0))
+
+# ---- Unique Missing Values Treatment for Test Data ----
+list_NAs_test <- sapply(dt_test, function(x) sum(is.na(x)))
+list_NAs_test <- sort(list_NAs_test[list_NAs_test > 0], decreasing = T)
+list_NAs_test
+paste("Number of variables in test data that contains NA: ", ifelse(length(list_NAs_test)>0, length(list_NAs_test), 0))
+
+### MSZoning
+summary(dt_test$MSZoning)
+ggplot(dt_train, aes(x = reorder(MSZoning, SalePrice, FUN = mean), y = SalePrice)) + geom_boxplot() 
+
+# Find Characteristics of MSZoning Commerical -> Pattern in Neighborhood (IDOTRR), GrLivArea (Relatively Smaller)
+dt_test[MSZoning == "C (all)", ]
+
+# GrLivArea (Relatively Smaller) -> by median yes!
+dt_test[, median(GrLivArea), by = MSZoning]
+
+# Neighborhood (IDOTRR) -> 13/53 Commerical for IDOTRR, but it hold 13/15 of all commercial
+table(dt_test[, Neighborhood, by = MSZoning])
+
+# MSZoning NAs -> IDOTRR with low GrLivArea -> Commerical property
+dt_test[is.na(MSZoning), c("MSZoning", "Neighborhood", "GrLivArea")]
+
+# Impute NAs 
+dt_test[is.na(MSZoning) & Neighborhood == "IDOTRR"  & GrLivArea < 1000, MSZoning := "C (all)"] # Commerical properties
+dt_test[is.na(MSZoning) & Neighborhood == "IDOTRR", MSZoning := "RM"] # mode for specific Neighborhood
+dt_test[is.na(MSZoning) & Neighborhood == "Mitchel", MSZoning := "RL"] # mode for specific Neighborhood
+
+### BasmtFullBath
+summary(dt_test$BsmtFullBath)
+dt_test[is.na(BsmtFullBath), ]
+# NA due to no basement -> Impute 0
+dt_test[is.na(BsmtFullBath), BsmtFullBath := 0]
+
+### BsmtHalfBath
+summary(dt_test$BsmtHalfBath)
+dt_test[is.na(BsmtHalfBath), ]
+# NA due to no basement -> Impute 0
+dt_test[is.na(BsmtHalfBath), BsmtHalfBath := 0]
+
+### Exterior1st
+summary(dt_test$Exterior1st)
+ggplot(dt_train, aes(x = reorder(Exterior1st, SalePrice, FUN = mean), y = SalePrice)) + geom_boxplot() 
+# Find characteristics of prpotery
+dt_test[is.na(Exterior1st),]
+dt_test[is.na(Exterior1st), c("Neighborhood", "MSSubClass", "BldgType", "HouseStyle", "ExterQual", "YearRemodAdd")]
+# Look for relationship between descriptive parameters and features
+table(dt_test[, Exterior1st, by = MSSubClass])
+table(dt_test[, Exterior1st, by = HouseStyle])
+table(dt_test[, Exterior1st, by = ExterQual])
+table(dt_test[, Exterior1st, by = YearRemodAdd]) # might suggest Vinyl if exterior was remade...
+table(dt_test[Neighborhood == "Edwards", Exterior1st, by = MSSubClass])
+table(dt_test[Neighborhood == "Edwards", Exterior1st, by = HouseStyle])
+table(dt_test[Neighborhood == "Edwards", Exterior1st, by = ExterQual])
+table(dt_test[Neighborhood == "Edwards", Exterior1st, by = YearRemodAdd]) # might suggest Vinyl if exterior was remade...
+
+# Impute NAs with categorcial mode value for Neighborhood and exterier quality. 
+dt_test[is.na(Exterior1st), Exterior1st := "Wd Sdng"] 
+
+### Exterior2nd -> Assume building only in one type of material
+summary(dt_test$Exterior2nd)
+# How likely is it for 2nd material?
+table(dt_test[, Exterior1st, by = Exterior2nd])
+# # How likely is it for 2nd material given Neighborhood and Exterior1st = wd sdng
+table(dt_test[Exterior1st == "Wd Sdng" & Neighborhood == "Edwards", Exterior2nd])
+
+# Impute NAs with same value as Exterior1st
+dt_test[is.na(Exterior2nd), Exterior2nd := "Wd Sdng"] 
+
+### BsmtFinSF1
+summary(dt_test$BsmtFinSF1)
+dt_test[is.na(BsmtFinSF1), ]
+# NA due to no basement -> Impute 0
+dt_test[is.na(BsmtFinSF1), BsmtFinSF1 := 0]
+
+### BsmtFinSF2
+summary(dt_test$BsmtFinSF2)
+dt_test[is.na(BsmtFinSF2), ]
+# NA due to no basement -> Impute 0
+dt_test[is.na(BsmtFinSF2), BsmtFinSF2 := 0]
+
+### BsmtUnfSF
+summary(dt_test$BsmtUnfSF)
+dt_test[is.na(BsmtUnfSF), ]
+# NA due to no basement -> Impute 0
+dt_test[is.na(BsmtUnfSF), BsmtUnfSF := 0]
+
+### TotalBsmtSF
+summary(dt_test$TotalBsmtSF)
+dt_test[is.na(TotalBsmtSF), ]
+# NA due to no basement -> Impute 0
+dt_test[is.na(TotalBsmtSF), TotalBsmtSF := 0]
+
+### KitchenQual
+summary(dt_test$KitchenQual)
+dt_test[is.na(KitchenQual), ] # NA propterty remade in 1950, Neighborhood ClearCr.
+# Look for average kitchen quality for properties remade between 1940-1960, 
+table(dt_test[YearRemodAdd > 1940 & YearRemodAdd < 1960, KitchenQual])
+# Avreage kitchen quality for neighborhood
+table(dt_test[Neighborhood == "ClearCr", KitchenQual])
+# Impute NAs with categorcial mode value  
+dt_test[is.na(KitchenQual), KitchenQual := "TA"]
+
+### Functional
+summary(dt_test$Functional)
+summary(dt_train$Functional)
+ggplot(dt_train, aes(x = reorder(Functional, SalePrice, FUN = mean), y = SalePrice)) + geom_boxplot() 
+dt_train[, mean(SalePrice), by = Functional]
+# Impute NAs with categorcial mode value  
+dt_test[is.na(Functional), Functional := "Typ"]
+
+### GarageCars
+summary(dt_test$GarageCars)
+dt_test[is.na(GarageCars),]
+# -- Notes states NA = No Garage -> 0 spots
+dt_test[is.na(GarageCars), GarageCars := 0]
+
+### GarageArea
+summary(dt_test$GarageArea)
+dt_test[is.na(GarageArea),]
+# -- Notes states NA = No Garage -> 0 spots
+dt_test[is.na(GarageArea), GarageArea := 0]
+
+### SaleType
+summary(dt_test$SaleType)
+ggplot(dt_train, aes(x = reorder(SaleType, SalePrice, FUN = mean), y = SalePrice)) + geom_boxplot() 
+# Features for NA properties
+dt_test[is.na(SaleType),] # SaleCondition Normal
+table(dt_test[SaleCondition == "Normal", SaleType])
+
+# Impute NAs with categorcial mode value  
+dt_test[is.na(SaleType), SaleType := "WD"]
+
+### Recheck NAs for test data
+list_NAs_test <- sapply(dt_test, function(x) sum(is.na(x)))
+list_NAs_test <- sort(list_NAs_test[list_NAs_test > 0], decreasing = T)
+list_NAs_test
+paste("Number of variables in test data that contains NA: ", ifelse(length(list_NAs_test)>0, length(list_NAs_test), 0))
+```
+
+## Outliers
+In this section we will detect, inspect and remove justifed outliers. Tools used are cook-distance and multivariate analysis for SalePrice.
+
+```{r Outliers}
+
+# Build regression model for SalePrice with all variables 
+SalePrice_lm <- lm(data = dt_train, SalePrice ~ .) 
+
+# Outliers Test
+outlierTest(SalePrice_lm)
+
+# Influence Plot (Indicate values based on Cook-Distance) - DEACTIVATED
+# influencePlot(SalePrice_lm,	id.method = "identify", main = "Influence Plot",
+#                sub = "Circle size is proportial to Cook's Distance")
+
+# Select Outliers and Check -> based on Cook-Distance
+selected_outliers <- c(1424, 1171, 826, 524, 1183, 198, 692) # 826, 524 also relative high cook distance...keep for now.
+# Discover outliers and characteristics
+dt_train[(selected_outliers),]
+dt_train[, lapply(.SD, mean), .SDcols = c("OverallCond", "GrLivArea", "LotFrontage", "SalePrice")]
+# 1 -> 1424 = above mean area, low lotfrontage area and low price -> drop
+# 2 -> 1171 = low area and mean price -> drop!
+# 3 -> 826 = median area and high price, new house! -> drop!
+# 4 -> 524 = high area and low price -> drop!
+# 5 -> 1183 = high area and high price -> reational outlier -> keep
+# 6 -> 198 = high area and low price, low quality, has pool, built 1918, remod 1990 -> drop!
+# 7 -> 692 = high area and high price -> reational outlier -> keep
+
+# Rows to drop
+selected_outliers_2 <- c(1424, 1171, 826, 524, 198)
+
+# Drop Rows of Selected Outliers
+dt_train <- dt_train[!(selected_outliers_2), ]
+
+### GrLivArea Outliers
+# Plot vs Saleprice
+ggplot(dt_train, aes(x=GrLivArea, y=SalePrice)) + geom_point() + geom_smooth(method=lm)
+
+# Subset data for big areas above 4000
+dt_train[GrLivArea >= 4000, ]
+
+# Remove outliers
+dt_train <- dt_train[!c(GrLivArea > 4000)]
+
+### The following outliers was also detected, however through testing it did not increase score. 
+
+# # Subset data for big areas and low price
+# dt_train[GrLivArea > 4000 & SalePrice < 6e+05, ]
+# 
+# # Remove outliers
+# dt_train <- dt_train[!c(GrLivArea > 4000 & SalePrice < 6e+05)]
+
+### LotArea Outliers -> Okay!
+# Plot vs Saleprice -> try for log relationship too
+# p1 <- ggplot(dt_train, aes(x = LotArea, y = SalePrice)) + geom_point() + geom_smooth(method=lm) 
+# p2 <- ggplot(dt_train, aes(x = LotArea, y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# p3 <- ggplot(dt_train, aes(x = log1p(LotArea), y = SalePrice)) + geom_point() + geom_smooth(method=lm)
+# p4 <- ggplot(dt_train, aes(x = log1p(LotArea), y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# grid.arrange(p1, p2, p3, p4, ncol=2, nrow=2)
+
+### Lotfrontage Outliers -> 2 rows dropped
+# Plot vs Saleprice -> try for log relationship too
+# p1 <- ggplot(dt_train, aes(x = LotFrontage, y = SalePrice)) + geom_point() + geom_smooth(method=lm) 
+# p2 <- ggplot(dt_train, aes(x = LotFrontage, y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# p3 <- ggplot(dt_train, aes(x = log1p(LotFrontage), y = SalePrice)) + geom_point() + geom_smooth(method=lm)
+# p4 <- ggplot(dt_train, aes(x = log1p(LotFrontage), y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# grid.arrange(p1, p2, p3, p4, ncol=2, nrow=2)
+
+# Subset data for lotfronage over 300
+# dt_train[LotFrontage > 300, ]
+# 
+# # Remove outliers
+# dt_train <- dt_train[!LotFrontage > 300]
+# 
+### GarageArea Outliers -> 3 rows dropped
+# Plot vs Saleprice -> try for log relationship too
+# p1 <- ggplot(dt_train, aes(x = GarageArea, y = SalePrice)) + geom_point() + geom_smooth(method=lm) 
+# p2 <- ggplot(dt_train, aes(x = GarageArea, y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# p3 <- ggplot(dt_train, aes(x = log1p(GarageArea), y = SalePrice)) + geom_point() + geom_smooth(method=lm)
+# p4 <- ggplot(dt_train, aes(x = log1p(GarageArea), y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# grid.arrange(p1, p2, p3, p4, ncol=2, nrow=2)
+
+# # Subset data for GarageArea over 1100 and SalePrice under 300K
+# dt_train[c(GarageArea > 1100 & SalePrice < 300000), ]
+# 
+# # Remove outliers
+# dt_train <- dt_train[!c(GarageArea > 1100 & SalePrice < 300000)]
+
+### TotalBsmtSF Outliers -> okay!
+# Plot vs Saleprice -> try for log relationship too
+# p1 <- ggplot(dt_train, aes(x = TotalBsmtSF, y = SalePrice)) + geom_point() + geom_smooth(method=lm) 
+# p2 <- ggplot(dt_train, aes(x = TotalBsmtSF, y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# p3 <- ggplot(dt_train, aes(x = log1p(TotalBsmtSF), y = SalePrice)) + geom_point() + geom_smooth(method=lm)
+# p4 <- ggplot(dt_train, aes(x = log1p(TotalBsmtSF), y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# grid.arrange(p1, p2, p3, p4, ncol=2, nrow=2)
+
+### EnclosedPorch Outliers -> 1 row dropped
+# Plot vs Saleprice -> try for log relationship too
+# p1 <- ggplot(dt_train, aes(x = EnclosedPorch, y = SalePrice)) + geom_point() + geom_smooth(method=lm) 
+# p2 <- ggplot(dt_train, aes(x = EnclosedPorch, y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# p3 <- ggplot(dt_train, aes(x = log1p(EnclosedPorch), y = SalePrice)) + geom_point() + geom_smooth(method=lm)
+# p4 <- ggplot(dt_train, aes(x = log1p(EnclosedPorch), y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# grid.arrange(p1, p2, p3, p4, ncol=2, nrow=2)
+
+# Subset data for EnclosedPorch over 400
+# dt_train[EnclosedPorch > 400, ]
+# 
+# # Remove outliers
+# dt_train <- dt_train[!EnclosedPorch > 400]
+
+### 1stFlrSF Outliers -> Okay!
+# Plot vs Saleprice -> try for log relationship too
+# p1 <- ggplot(dt_train, aes(x = X1stFlrSF, y = SalePrice)) + geom_point() + geom_smooth(method=lm) 
+# p2 <- ggplot(dt_train, aes(x = X1stFlrSF, y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# p3 <- ggplot(dt_train, aes(x = log1p(X1stFlrSF), y = SalePrice)) + geom_point() + geom_smooth(method=lm)
+# p4 <- ggplot(dt_train, aes(x = log1p(X1stFlrSF), y = log1p(SalePrice))) + geom_point() + geom_smooth(method=lm)
+# grid.arrange(p1, p2, p3, p4, ncol=2, nrow=2)
+```
+
+## Feature Creation
+In this section we will create new features by transforming and adding exisiting features: 
+1) Oridinal transformation -> impute numeric range for ordinal categorical features. 
+2) Simplified transformation -> lower the number of levels of selected categorical values.
+3) New feautres -> by adding and modify existing features together.
+4) Aggereate features -> group features and compute a aggreated score.
+
+```{r Feature Creation}
+
+# ---- Ordinal Feature Creation  ----
+# Function Transform ordinal variables to numeric scale
+ordinal_transformation <- function(dt) {
+  ### Basements
+  dt[, OrdinalBsmtQual := dplyr::recode(BsmtQual, "None" = 0, "Po" = 1, "Fa" = 2, "TA" = 3, "Gd" = 4, "Ex" = 5)]
+  dt[, OrdinalBsmtCond := dplyr::recode(BsmtCond, "None" = 0, "Po" = 1, "Fa" = 2, "TA" = 3, "Gd" = 4, "Ex" = 5)]
+  dt[, OrdinalBsmtExposure := dplyr::recode(BsmtExposure, "None" = 0, "No" = 1, "Mn" = 2, "Av" = 3, "Gd" = 4)]
+  dt[, OrdinalBsmtFinType1 := dplyr::recode(BsmtFinType1, "None" = 0, "Unf" = 1, "LwQ" = 2, "Rec" = 3, "BLQ" = 4, "ALQ" = 5, "GLQ" = 6)]
+  dt[, OrdinalBsmtFinType2 := dplyr::recode(BsmtFinType2, "None" = 0, "Unf" = 1, "LwQ" = 2, "Rec" = 3, "BLQ" = 4, "ALQ" = 5, "GLQ" = 6)]
+  ### Garage
+  dt[, OrdinalGarageFinish := dplyr::recode(GarageFinish, "None" = 1, "Unf" = 1, "RFn" = 2, "Fin" = 3)]
+  dt[, OrdinalGarageQual := dplyr::recode(GarageQual, "None" = 0, "Po" = 1, "Fa" = 2, "TA" = 3, "Gd" = 4, "Ex" = 5)]
+  dt[, OrdinalGarageCond := dplyr::recode(GarageCond, "None" = 0, "Po" = 1, "Fa" = 2, "TA" = 3, "Gd" = 4, "Ex" = 5)]
+  ### Kitchen
+  dt[, OrdinalKitchenQual := dplyr::recode(KitchenQual, "None" = 0, "Po" = 1, "Fa" = 2, "TA" = 3, "Gd" = 4, "Ex" = 5)]
+  ### Utilities
+  dt[, OrdinalHeatingQC := dplyr::recode(HeatingQC, "None" = 0, "Po" = 1, "Fa" = 2, "TA" = 3, "Gd" = 4, "Ex" = 5)]
+  dt[, OrdinalElectrical := dplyr::recode(Electrical, "None" = 0, "Unkown" = 1, "Mix" = 2, "FuseP" = 1, "FuseF" = 2, "FuseA" = 3, "SBrkr" = 4)]
+  ### Exterior
+  dt[, OrdinalExterCond := dplyr::recode(ExterCond, "None" = 0, "Po" = 1, "Fa" = 2, "TA"= 3, "Gd"= 4, "Ex" = 5)]
+  dt[, OrdinalExterQual := dplyr::recode(ExterQual, "None" = 0, "Po" = 1, "Fa" = 2, "TA"= 3, "Gd"= 4, "Ex" = 5)]
+  ### LandFeatures
+  dt[, OrdinalLandSlope := dplyr::recode(LandSlope, "None" = 0, "Sev" = 1, "Mod" = 2, "Gtl" = 3)]
+  dt[, OrdinalLotShape := dplyr::recode(LotShape, "None" = 0, "IR3" = 1, "IR2" = 2, "IR1" = 3, "Reg" = 4)]
+  ### Fireplaces
+  dt[, OrdinalFireplaceQu := dplyr::recode(FireplaceQu, "None" = 0, "Po" = 1, "Fa" = 2, "TA"= 3, "Gd"= 4, "Ex" = 5)]
+  ### Pool
+  dt[, OrdinalPoolQC := dplyr::recode(PoolQC, "None" = 0, "Po" = 1, "Fa" = 2, "TA"= 3, "Gd"= 4, "Ex" = 5)]
+  ### Fence
+  dt[, OrdinalFence := dplyr::recode(Fence, "None" = 0, "MnWw" = 1, "GdWo" = 2, "MnPrv" = 3, "GdPrv" = 4)]
+  ### Driveway
+  dt[, OrdinalPavedDrive := dplyr::recode(PavedDrive, "None" = 0, "N" = 0, "P" = 1, "Y"= 2)]
+  ### Street
+  dt[, OrdinalStreet := dplyr::recode(Street, "None" = 0, "Grvl" = 1, "Pave" = 2)]
+}
+
+# Run function for train and test data
+ordinal_transformation(dt_train)
+ordinal_transformation(dt_test)
+
+# ---- Simplefied Feature Creation ----
+feature_simplification <- function(dt) {
+  
+  ### RoofMaterial - shrink to 2 levels -> CompShg / Other
+  dt[, SimpleRoofMatl := dplyr::recode(RoofMatl, "ClyTile" = "Other", "Membran" = "Other", "Metal" = "Other", "Roll" = "Other",
+                                       "Tar&Grv" = "Other", "WdShake" = "Other", "WdShngl" = "Other")]
+  
+  ### RoofStyle - shrink to 3 levels -> Gable / Hip / Other
+  dt[, SimpleRoofStyle := dplyr::recode(RoofStyle, "Flat" = "Other", "Gambrel" = "Other", "Mansard" = "Other", "Shed" = "Other")]
+  
+  ### HouseStyle - shrink to 3 levels -> 1Story / 2Story / Other
+  dt[, SimpleHouseStyle := dplyr::recode(HouseStyle, "1.5Fin" = "1Story", "1.5Unf" = "1Story", "2.5Fin" = "2Story", "2.5Unf" = "2Story",
+                                         "SFoyer" = "Other", "SLvl" = "Other")]
+  
+  ### BldgType - shrink to 3 levels -> 1Fam / TwnhsE / Other
+  dt[, SimpleBldgType := dplyr::recode(BldgType, "2fmCon" = "Other", "Duplex" = "Other", "Twnhs" = "Other")]
+  
+  ### Condition1 - shrink to 3 levels -> Normal / Positive / Negative -> make ordinal
+  dt[, SimpleCondition1 := dplyr::recode(Condition1, "Feedr" = "Negative", "Artery" = "Negative", "RRAe" = "Negative", "RRNe" = "Negative",
+                                       "RRNe" = "Negative", "PosN" = "Positive", "PosA" = "Positive", "RRNe" = "Positive", "RRNn" = "Positive")]
+  
+  ### Condition2 - shrink to 2 levels -> Normal / Other
+  dt[, SimpleCondition2 := dplyr::recode(Condition2, "Feedr" = "Other", "Artery" = "Other", "RRAe" = "Other", "RRNe" = "Other",
+                                         "RRNe" = "Other", "PosN" = "Other", "PosA" = "Other", "RRNe" = "Other", "RRNn" = "Other")]
+  
+  ### Alley - shrink to 2 levels -> Yes / None
+  dt[, SimpleAlley := dplyr::recode(Alley, "Grvl" = "Yes", "Pave" = "Yes")]
+  
+  ### Functional - shrink to 2 levels -> Typ / Other
+  dt[, SimpleFunctional := dplyr::recode(Functional, "Maj1" = "Other", "Maj2" = "Other", "Min1" = "Other", "Min2" = "Other",
+                                         "Mod" = "Other", "Sev" = "Other")]
+  
+  ### Heating - shrink to 3 levels -> GasA / GasW / Other
+  dt[, SimpleHeating := dplyr::recode(Heating, "Floor" = "Other", "Grav" = "Other", "OthW" = "Other", "Wall" = "Other")]
+  
+  ### MiscFeature - shrink to 2 levels -> Feature / None
+  dt[, SimpleMiscFeature := dplyr::recode(MiscFeature, "Gar2" = "Feature", "Othr" = "Feature", "Shed" = "Feature", "TenC" = "Feature")]
+  
+  ### SaleType - shrink to 3 levels ->  WD / New / Other
+  dt[, SimpleSaleType := dplyr::recode(SaleType, "COD" = "Other", "Con" = "Other", "ConLD" = "Other", "ConLI" = "Other", "ConLw" = "Other",
+                                          "CWD" = "Other", "Oth" = "Other")]
+  
+  ### SaleCondition shrink to 2 levels ->  NotNormal / Normal
+  dt[, SimpleSaleCondition := dplyr::recode(SaleCondition, "Abnorml" = "NotNormal", "Alloca" = "NotNormal", "AdjLand" = "NotNormal", "Family" = "NotNormal", "Partial" = "Normal")]
+  
+  ### PoolQC shrink to 2 levels ->  Pool / None
+  dt[, SimplePoolQC := dplyr::recode(PoolQC, "Ex" = "Pool", "Gd" = "Pool", "Fa" = "Pool", "TA" = "Pool")]
+  
+  ### PavedDrive shrink to 2 levels ->  Yes / No
+  dt[, SimplePavedDrive := dplyr::recode(PavedDrive, "N" = "No", "P" = "Yes", "Y" = "Yes")]
+  
+  ### Foundation shrink to 3 levels -> CBlock / PConc / Other
+  dt[, SimpleFoundation := dplyr::recode(Foundation, "BrkTil" = "Other", "Slab" = "Other", "Stone" = "Other", "Wood" = "Other")]
+  
+  ### MasVnrType shrink to 2 levels ->  Yes / None
+  dt[, SimpleMasVnrType := dplyr::recode(MasVnrType, "BrkCmn" = "Yes", "BrkFace" = "Yes", "Stone" = "Yes")]
+  
+  ### LotConfig shrink to 3 levels ->  Corner / Inside / Other
+  dt[, SimpleLotConfig := dplyr::recode(LotConfig, "CulDSac" = "Other", "FR2" = "Other", "FR3" = "Other")]
+  
+  ### MSSubClass shrink to 3 levels ->  Newer / Older / All
+  dt[, SimpleMSSubClass := dplyr::recode(MSSubClass, "20" = "New", "60" = "New", "120" = "New", "160" = "New",
+                                         "30" = "Old",  "70" = "Old",
+                                         "40" = "All", "45" = "All", "50" = "All", "75" = "All", "80" = "All", "85" = "All",
+                                         "90" = "All", "150" = "All", "180" = "All", "190" = "All")]
+  
+  ### MoSold shrink to 2 levels ->  Peak / OffPeak
+  dt[, SimpleMoSold := dplyr::recode(MoSold, "1" = "OffPeak", "2" = "OffPeak", "3" = "OffPeak", "4" = "OffPeak", "8" = "OffPeak",
+                                     "9" = "OffPeak", "10" = "OffPeak", "11" = "OffPeak", "12" = "OffPeak",
+                                     "5" = "Peak", "6" = "Peak", "7" = "Peak")]
+  
+  ### GarageType shrink to 5 levels ->  Attchd / Detchd / BuiltIn / Other / None
+  #ggplot(dt_train, aes(x=GarageType, y=SalePrice)) + geom_boxplot()
+  dt[, SimpleGarageType := dplyr::recode(GarageType, "2Types" = "Other", "Basment" = "Other", "CarPort" = "Other")]
+  
+}
+
+# Run function over train and test data
+feature_simplification(dt_train)
+feature_simplification(dt_test)
+  
+# ---- New Features Creation ----
+
+feature_creation <- function(dt) {
+  
+  ### House Age
+  dt[, HouseAge := (YrSold - YearBuilt)]
+  ### Years since remodeled
+  dt[, YrsSinceRemod := (YrSold - YearRemodAdd)]
+  ### Total Square Feet 
+  dt[, TotalSF := (GrLivArea + TotalBsmtSF)]
+  ### Total Floor Square Feet 
+  dt[, TotalFloorSF := (X1stFlrSF + X2ndFlrSF)]
+  ###  Average room size
+  dt[, AvgRoomSize := (GrLivArea / TotRmsAbvGrd)]
+  ### Comparative size of living area
+  dt[, RelativeSize := (GrLivArea / mean(GrLivArea))]
+  ### Total number of bathrooms
+  dt[, TotNrBaths := (FullBath + (0.5 * HalfBath) + BsmtFullBath + (0.5 * BsmtHalfBath))]
+  ### Bathroom to bedroom ratio: Only count above ground baths
+  dt[, WCsPerBedrooms := ifelse(BedroomAbvGr == 0, 0, ((FullBath + HalfBath) / BedroomAbvGr))]
+  ### Porch Size
+  dt[, TotalPorchSize := (OpenPorchSF + EnclosedPorch + X3SsnPorch + ScreenPorch)]
+  
+  # Did not improve score - disregard
+  ### CompletedAtSale
+  #dt[, CompletedAtSale := ifelse(SaleCondition == "Partial", 0, 1)]
+  ### NewHouse(less than 10 years hold)
+  #dt[, NewHouse := ifelse(YearBuilt > 2000 , 1, 0)]
+  
+  
+  # Create aggerate score for various features
+  ### Overall
+  dt[, OverallScore := (OverallQual * OverallCond)]
+  ### Kitchen
+  dt[, KitchenScore := (OrdinalKitchenQual * KitchenAbvGr)]
+  ### Basement
+  dt[, BsmtScore := (OrdinalBsmtQual * OrdinalBsmtCond * (OrdinalBsmtExposure + 1) * TotalBsmtSF * OrdinalBsmtFinType1 * OrdinalBsmtFinType2)]
+  ### Garage
+  # GarageCars and Area strongly related, but Nr of Cars stronger.
+  dt[, GarageScore := (OrdinalGarageFinish * OrdinalGarageQual * OrdinalGarageCond * (1 + GarageCars))]
+  ### Utility
+  dt[, UtilityScore := (OrdinalHeatingQC * OrdinalElectrical)]
+  ### Exterior
+  dt[, ExterScore := (OrdinalExterCond * OrdinalExterQual)]
+  ### LandFeatures
+  dt[, LandFeatureScore := (OrdinalLandSlope * OrdinalLotShape)]
+  ### Fireplace
+  dt[, FireplaceScore := (OrdinalFireplaceQu * Fireplaces)]
+  ### Pool
+  dt[, PoolScore := (OrdinalPoolQC * PoolArea)]
+}
+# Run function for train and test data
+feature_creation(dt_train)
+feature_creation(dt_test)
+
+### Polynomials -> To polarize important features based on info gain and chi-squred (re-interative process)
+# Features chosen for Polynomials from testing
+poly_vars <- c("TotalSF", "OverallQual", "OrdinalHeatingQC", "GarageCars", "FullBath",
+               "ExterScore", "Fireplaces", "OrdinalKitchenQual", "OrdinalBsmtQual", "OrdinalGarageFinish")
+
+# Polynomials aka already tested:
+# GrLivArea
+# KitchenScore
+# BsmtScore
+# WCsPerBedrooms -> maybe was better?
+
+### Function to compute Polynomials 
+polynomial_features <- function(dt) {
+
+dt[, paste0(poly_vars,"-sqrt") := lapply(.SD, sqrt), .SDcols = poly_vars]
+dt[, paste0(poly_vars,"-s2") := lapply(.SD, function(x) x^2), .SDcols = poly_vars]
+dt[, paste0(poly_vars,"-s3") := lapply(.SD, function(x) x^3), .SDcols = poly_vars]
+}
+# Run function for train and test data
+polynomial_features(dt_train)
+polynomial_features(dt_test)
+
+
+```
+
+
+## Log Transformation
+In this section we will conduct log transformation for skewed numerical features based on a set threshold. Through testing the best critical level was 0.65.
+
+```{r Data Transformation}
+
+# ---- Log transformation ----
+
+### Log transformations - Training and Test Data
+# Create list with skewness for all numeric variables for test_data
+list_skewness <- dt_train[, sapply(.SD, skewness, na.rm = T), .SDcols = names(which(sapply(dt_train, is.integer)))]
+list_skewness <- c(list_skewness, dt_train[, sapply(.SD, skewness, na.rm = T), .SDcols = names(which(sapply(dt_train, is.numeric)))])
+
+# Exclude polynomials
+ploy_columns <- c(names(list_skewness)[names(list_skewness) %like% "s2"],
+                  names(list_skewness)[names(list_skewness) %like% "s3"],
+                  names(list_skewness)[names(list_skewness) %like% "sqrt"])
+
+list_skewness <- list_skewness[!names(list_skewness) %in% ploy_columns]
+
+# Set threshold for skewness
+skew_thres <- 0.65
+
+# Subset all columns based on skewness threshold  
+skewed_columns <- unique(names(list_skewness[list_skewness > skew_thres]))
+skewed_columns_test <- unique(skewed_columns[skewed_columns != "SalePrice"])
+skewed_columns
+skewed_columns_test
+
+# Transform skewed columns using log1p
+dt_train[, (skewed_columns) := lapply(.SD, log1p), .SDcols = skewed_columns] 
+dt_test[, (skewed_columns_test) := lapply(.SD, log1p), .SDcols = skewed_columns_test] 
+```
+
+## Train & Validation Spliting
+In this section we split the traning data into a sub training (76.8%) and validation set(23.2%). We also check the number of levels for all categorical featrues, one level would result in error in either split with result in error. 
+
+```{r Train & Validation Spliting}
+# Split data into training and validation
+### Function for splitting
+splitdt <- function(DT, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  index <- 1:nrow(DT)
+  trainindex <- sample(index, trunc(length(index) / 1.3))
+  trainset <- DT[trainindex, ]
+  testset <- DT[-trainindex, ]
+  list(trainset = trainset, testset = testset)
+}
+
+### Execute spliting 
+splits <- splitdt(dt_train, seed = 1)
+train_split <- splits$trainset
+validation_split <- splits$testset
+
+# ---- Inspect Factor Levels ----
+# Training Split
+### Get Factor variables from training split
+train_factor_columns <- names(which(sapply(train_split, is.factor)))
+### Show number of factor levels per variable
+sort(sapply(lapply(na.omit(train_split[, train_factor_columns, with = F]), droplevels), nlevels), decreasing = F)
+
+# Validation Split
+### Get Factor variables from training split
+validation_factor_columns <- names(which(sapply(validation_split, is.factor)))
+### Show number of factor levels per variable
+sort(sapply(lapply(na.omit(validation_split[, validation_factor_columns, with = F]), droplevels), nlevels), decreasing = F)
+
+# Test Data
+### Get Factor variables from training split
+test_factor_columns <- names(which(sapply(dt_test, is.factor)))
+### Show number of factor levels per variable
+sort(sapply(lapply(na.omit(dt_test[, test_factor_columns, with = F]), droplevels), nlevels), decreasing = F)
+```
+
+
+
+## Baseline: LM with all features 
+In this section we train a simple linear regression model with all features. The RMSE from our prediction will act as baseline to see if our model type and feature selection is better or wrose.
+
+```{r Baseline LM Model, warning=FALSE, message=FALSE}
+
+### Full Model - lm model with all features - to evaluate the impact of the feature engineering
+# Define configuration of model
+train_control_config_lm <- trainControl(method = "repeatedcv", 
+                                     number = 5, 
+                                     repeats = 5,
+                                     returnResamp = "all")
+# Run lm model
+full_lm_mod <- train(SalePrice ~ ., data = train_split, 
+                     method = "lm", 
+                     metric = "RMSE",
+                     preProc = c("center", "scale"),
+                     trControl = train_control_config_lm)
+
+# Uniate levels from model with validation split
+for (x in names(validation_split)) {
+  full_lm_mod$xlevels[[x]] <- union(full_lm_mod$xlevels[[x]], levels(validation_split[[x]]))
+}
+
+# Make predictions for SalePrice in validation data
+full_lm_mod_pred <- predict(full_lm_mod, newdata = validation_split[, !"SalePrice", with = F])
+
+# All failed predictions set to zero
+full_lm_mod_pred[is.na(full_lm_mod_pred)] <- 0
+
+# Combine predicted and observed SalePrice from validation data 
+my_data = as.data.frame(cbind(predicted = full_lm_mod_pred, observed = validation_split$SalePrice))
+
+# Save RMSE
+full_lm_mod_RMSE <- sqrt(mean((full_lm_mod_pred - validation_split$SalePrice)^2))
+
+# Plot Actual vs Predicted values
+ggplot(data = my_data, aes(predicted, observed)) + geom_point() + geom_smooth(method = "lm") +
+  labs(x="Predicted") + ggtitle('Linear Model')
+
+# Print Results
+paste("Full Linear Regression RMSE = ", full_lm_mod_RMSE)
+
+```
+
+## Filter Methods: Chi-squred & Information Gain
+In this section we train two new linear regression models based on two different feature selection techniques, chi-squered and Information Gain. For both methods we set a critical value that will exlucde more or less features by assessing the importence of all features. The chosen critical value for chi-squered is 0.37 and Information Gain is 0.27. Both values found through trial and error.
+
+```{r Filter Methods, warning=FALSE, message=FALSE}
+### Feature Selection : Filter Methods
+# ---- Chi-squared Selection ----
+
+### Calculate ChiSquared based on training data
+chi_weights <- data.frame(chi.squared(SalePrice ~ ., dt_train))
+
+# Display variables ranked by importance
+chi_weights$feature <- rownames(chi_weights)
+chi_weights[order(chi_weights$attr_importance, decreasing = TRUE), ][1]
+
+# Set importance threshold 
+chi_thres <- 0.37
+
+# Subset name features thats pass threshold
+chi_squared_features <- chi_weights$feature[chi_weights$attr_importance >= chi_thres]
+
+# Train Config for LM
+train_control_config_filter <- trainControl(method = "repeatedcv", 
+                                     number = 10, 
+                                     repeats = 3,
+                                     returnResamp = "all")
+
+### Compute new LM with subsetted features
+chi_squared_lm_mod <- train(SalePrice ~ ., data = train_split[, c(chi_squared_features, "SalePrice"), with = F], 
+                            method = "lm", 
+                            metric = "RMSE",
+                            preProc = c("center", "scale"),
+                            trControl = train_control_config_filter)
+
+# Uniate levels from model with validation split
+for (x in names(validation_split)) {
+  chi_squared_lm_mod$xlevels[[x]] <- union(chi_squared_lm_mod$xlevels[[x]], levels(validation_split[[x]]))
+}
+
+# Make predictions for SalePrice in validation data
+chi_squared_lm_mod_pred <- predict(chi_squared_lm_mod, newdata = validation_split[, !"SalePrice", with = F])
+
+# All failed predictions set to zero
+chi_squared_lm_mod_pred[is.na(chi_squared_lm_mod_pred)] <- 0
+
+# Combine predicted and observed SalePrice from validation data 
+my_data_chi = as.data.frame(cbind(predicted = chi_squared_lm_mod_pred, observed = validation_split$SalePrice))
+
+# Save RMSE
+chi_squared_lm_mod_RMSE <- sqrt(mean((chi_squared_lm_mod_pred - validation_split$SalePrice)^2))
+
+# Plot Actual vs Predicted values
+ggplot(data = my_data_chi, aes(predicted, observed)) + geom_point() + geom_smooth(method = "lm") + labs(x="Predicted") +
+  ggtitle('Linear Model')
+
+# Print Results
+paste("Chi-Squared Filtered Linear Regression RMSE = ", chi_squared_lm_mod_RMSE)
+
+
+# ---- Information Gain Selection ----
+### Calculate information gain on training data
+info_gain_weights <- data.frame(information.gain(SalePrice~., dt_train))
+
+# Display variables ranked by importance
+info_gain_weights$feature <- rownames(info_gain_weights)
+info_gain_weights[order(info_gain_weights$attr_importance, decreasing = TRUE),][1]
+
+# Set importance threshold
+info_gain_thres <- 0.27
+
+# Subset name features thats pass threshold
+info_gain_features <- info_gain_weights$feature[info_gain_weights$attr_importance >= info_gain_thres]
+
+### Compute new LM with subsetted features
+info_gain_lm_mod <- train(SalePrice ~ ., data = train_split[, c(info_gain_features, "SalePrice"), with = F], 
+                          method = "lm", 
+                          metric = "RMSE",
+                          preProc = c("center", "scale"),
+                          trControl = train_control_config_filter)
+
+# Run model over each variable in validation data
+for (x in names(validation_split)) {
+  info_gain_lm_mod$xlevels[[x]] <- union(info_gain_lm_mod$xlevels[[x]], levels(validation_split[[x]]))
+}
+# Make predictions for SalePrice in validation data
+info_gain_lm_mod_pred <- predict(info_gain_lm_mod, newdata = validation_split[, !"SalePrice", with = F])
+
+# All failed predictions set to zero
+info_gain_lm_mod_pred[is.na(info_gain_lm_mod_pred)] <- 0
+
+# Combine predicted and observed SalePrice from validation data 
+my_data_info_gain = as.data.frame(cbind(predicted = info_gain_lm_mod_pred, observed = validation_split$SalePrice))
+
+# Save RMSE
+info_gain_lm_mod_RMSE <- sqrt(mean((info_gain_lm_mod_pred - validation_split$SalePrice)^2))
+
+# Plot Actual vs Predicted values
+ggplot(data = my_data_info_gain, aes(predicted, observed)) + geom_point() + geom_smooth(method = "lm") + labs(x="Predicted") +
+  ggtitle('Linear Model')
+
+# Print Results
+paste("IG Filtered Linear Regression RMSE = ", info_gain_lm_mod_RMSE)
+
+```
+
+## Wrapper Methods: Stepwise Backwards/Forwards
+##### Code DEACTIVATED due to long load time
+In this section we train two new linear regression models based on two different feature selection techniques,
+backward and forward stepwise. The tuning parameter here was the number of steps. This methods was somewhat overlooked as none produced better predictions compared to models based on filter and embedded methods. 
+
+```{r Wrapper Methods, eval = FALSE}
+
+### Modeling: Wrapper Methods
+# ---- Backward Stepwise ----
+
+# Define configurations
+train_control_config_4_stepwise <- trainControl(method = "none")
+
+# Compute new LM using backward stepwise
+backward_lm_mod <- train(SalePrice ~ ., data = train_split, 
+                         method = "glmStepAIC", 
+                         direction = "backward",
+                         trace = FALSE,
+                         metric = "RMSE",
+                         steps = 10,
+                         preProc = c("center", "scale"),
+                         trControl = train_control_config_4_stepwise)
+
+# Features chosen by model
+paste("Features Selected" , backward_lm_mod$finalModel$formula[3])
+
+# Uniate levels from model with validation split
+for (x in names(validation_split)) {
+  backward_lm_mod$xlevels[[x]] <- union(backward_lm_mod$xlevels[[x]], levels(validation_split[[x]]))
+}
+# Make predictions for SalePrice in validation data
+backward_lm_mod_pred <- predict(backward_lm_mod, validation_split[, !"SalePrice", with = F])
+
+# All failed predictions set to zero
+backward_lm_mod_pred[is.na(backward_lm_mod_pred)] <- 0
+
+# Combine predicted and observed SalePrice from validation data 
+my_data_back = as.data.frame(cbind(predicted = backward_lm_mod_pred, observed = validation_split$SalePrice))
+
+# Save RMSE
+backward_lm_mod_RMSE <- sqrt(mean((backward_lm_mod_pred - validation_split$SalePrice)^2))
+
+# Plot Actual vs Predicted values
+ggplot(data = my_data_back, aes(predicted, observed)) + geom_point() + geom_smooth(method = "lm") + labs(x="Predicted") +
+  ggtitle('Linear Model')
+
+# Print Results
+paste("Backward Linear Regression RMSE = ", backward_lm_mod_RMSE)
+
+# ---- Forward Stepwise ----
+
+# Define configurations
+train_control_config_4_stepwise <- trainControl(method = "none")
+
+# Compute new LM using forward stepwise
+forward_lm_mod <- train(x = train_split[, !"SalePrice", with = F], y = train_split$SalePrice, 
+                        method = "glmStepAIC", 
+                        direction = "forward",
+                        trace = FALSE,
+                        metric = "RMSE",
+                        steps = 15,
+                        preProc = c("center", "scale"),
+                        trControl = train_control_config_4_stepwise)
+
+# Features chosen by model
+paste("Features Selected" , forward_lm_mod$finalModel$formula[3])
+
+# Uniate levels from model with validation split
+for (x in names(validation_split)) {
+  forward_lm_mod$xlevels[[x]] <- union(forward_lm_mod$xlevels[[x]], levels(validation_split[[x]]))
+}
+
+# Make predictions for SalePrice in validation data
+forward_lm_mod_pred <- predict(forward_lm_mod, validation_split[, !"SalePrice", with = F])
+
+# All failed predictions set to zero
+forward_lm_mod_pred[is.na(forward_lm_mod_pred)] <- 0
+
+# Combine predicted and observed SalePrice from validation data 
+my_data_forward = as.data.frame(cbind(predicted = info_gain_lm_mod_pred, observed = validation_split$SalePrice))
+
+# Plot Actual vs Predicted values
+ggplot(data = my_data_forward, aes(predicted, observed)) + geom_point() + geom_smooth(method = "lm") + labs(x="Predicted") +
+  ggtitle('Linear Model')
+
+# Save RMSE
+forward_lm_mod_RMSE <- sqrt(mean((forward_lm_mod_pred - validation_split$SalePrice)^2))
+
+# Print results
+paste("Forward Linear Regression RMSE = ", forward_lm_mod_RMSE)
+
+
+```
+
+## Embedded Methods: Ridge & Lasso & Elastic Regularisation
+In this section we train three new linear regression models by conducting feature selection through regularisation techniques: Ridge, Lasso and a mix of both i.e. Elastic Net. Models are cross-validated to find best lambda and for Elastic also alpha.
+
+```{r Embedded Methods, warning=FALSE, message=FALSE}
+### Modeling: Embedded Methods
+# ---- Ridge Regression ----
+# Lambda settings
+ridge_lambdas <- 10^seq(-2, 3, by = .1)
+
+# Model 
+ridge_mod <- glmnet(x = data.matrix(train_split[, !"SalePrice", with = F]), y = train_split$SalePrice,
+                    alpha = 0, lambda = ridge_lambdas)
+
+# Cross-validation based model
+ridge_cv_fit <- cv.glmnet(x = data.matrix(train_split[, !"SalePrice", with = F]), y = train_split$SalePrice,
+                          alpha = 0, lambda = ridge_lambdas, nfolds = 20)
+
+# Plot results
+# plot(ridge_cv_fit)
+
+# Assess best lambda
+ridge_best_lam <- ridge_cv_fit$lambda.min
+paste("Best Lambda value from CV=", ridge_best_lam)
+
+# Predict values with best lambda
+ridge_pred_best_lam = predict(ridge_mod, s = ridge_best_lam, data.matrix(validation_split[, !"SalePrice", with = F]))
+
+# Save RMSE
+ridge_best_lam_RMSE <- sqrt(mean((ridge_pred_best_lam - validation_split$SalePrice)^2))
+
+# Print results 
+paste("RMSE for lambda ", ridge_best_lam, " = ", ridge_best_lam_RMSE)
+
+# Derive 1 SE Lambda
+ridge_lam_1se <- ridge_cv_fit$lambda.1se
+paste("Lambda 1se value from CV=", ridge_lam_1se)
+
+# Predict values with 1 SE lambda
+ridge_pred_1se_lam = predict(ridge_mod, s = ridge_lam_1se, data.matrix(validation_split[, !"SalePrice", with = F]))
+
+# Save RMSE
+ridge_1se_lam_RMSE <- sqrt(mean((ridge_pred_1se_lam - validation_split$SalePrice)^2))
+
+# Print results
+paste("RMSE for lambda ", ridge_lam_1se, " = ", ridge_1se_lam_RMSE)
+
+# Plot important coefficiants
+my_data_ridge = as.data.frame(cbind(predicted = ridge_pred_1se_lam, observed = validation_split$SalePrice))
+
+ggplot(my_data_ridge, aes(my_data_ridge["1"], observed)) + geom_point() + geom_smooth(method = "lm") +
+  scale_x_continuous(expand = c(0, 0)) + labs(x = "Predicted") + ggtitle('Ridge')
+
+# # Print, plot variable importance
+ridge_imp_best_lam <- varImp(ridge_mod, lambda = ridge_best_lam)
+ridge_names_best_lam <- rownames(ridge_imp_best_lam)[order(ridge_imp_best_lam$Overall, decreasing=TRUE)]
+ridge_importance_best_lam <- ridge_imp_best_lam[ridge_names_best_lam, ]
+
+ridge_features_used <- data.frame(row.names = ridge_names_best_lam, ridge_importance_best_lam)
+
+# ---- Lasso Regresion ----
+# Set Lambda
+lasso_lambdas <- 10^seq(-3, 3, by = .1)
+
+# Model
+lasso_mod <- glmnet(x = data.matrix(train_split[, !"SalePrice", with = F]), y = train_split$SalePrice,
+                    alpha = 1, lambda = lasso_lambdas)
+
+# Cross-validation based model
+lasso_cv_fit <- cv.glmnet(x = data.matrix(train_split[, !"SalePrice", with = F]), y = train_split$SalePrice,
+                          alpha = 1, lambda = lasso_lambdas, nfolds = 20)
+# Plot Model
+plot(lasso_cv_fit)
+
+# Best Lambda
+lasso_best_lam <- lasso_cv_fit$lambda.min
+paste("Best Lambda value from CV=", lasso_best_lam)
+
+# Prediction based on best lambda
+lasso_pred_best_lam <- predict(lasso_mod, s = lasso_best_lam, data.matrix(validation_split[, !"SalePrice", with = F]))
+
+# Save RMSE
+lasso_best_lam_RMSE <- sqrt(mean((lasso_pred_best_lam - validation_split$SalePrice)^2))
+
+# Print results
+paste("RMSE for lambda ", lasso_best_lam, " = ", lasso_best_lam_RMSE)
+
+# Derive 1 SE Lambda
+lasso_lam_1se <- lasso_cv_fit$lambda.1se
+paste("Lambda 1se value from CV=", lasso_lam_1se)
+
+# Prediction based on best lambda
+lasso_pred_1se <- predict(lasso_mod, s = lasso_lam_1se, data.matrix(validation_split[, !"SalePrice", with = F]))
+
+# Save RMSE
+lasso_1se_RMSE <- sqrt(mean((lasso_pred_1se - validation_split$SalePrice)^2))
+
+# Print results 
+paste("RMSE for lambda ", lasso_lam_1se, " = ", lasso_1se_RMSE)
+
+# Plot important coefficients
+my_data_lasso = as.data.frame(cbind(predicted = lasso_pred_best_lam, observed = validation_split$SalePrice))
+
+ggplot(my_data_lasso, aes(my_data_lasso["1"], observed)) + geom_point() +geom_smooth(method="lm") +
+  scale_x_continuous(expand = c(0,0)) + labs(x="Predicted") + ggtitle('Lasso')
+
+# Print, plot variable importance
+lasso_imp_best_lam <- varImp(lasso_mod, lambda = lasso_best_lam)
+lasso_names_best_lam <- rownames(lasso_imp_best_lam)[order(lasso_imp_best_lam$Overall, decreasing=TRUE)]
+lasso_importance_best_lamp <- lasso_imp_best_lam[lasso_names_best_lam, ]
+
+lasso_features <- data.frame(row.names = lasso_names_best_lam, lasso_importance_best_lamp)
+lasso_features_used <- rownames(lasso_imp_best_lam)[lasso_imp_best_lam$Overall>0]
+
+# ---- Elastic Net ----
+# Lambda grid
+elastic_lambdas <- 10^seq(-3, 3, by = 0.1)
+
+# Alpha gird
+elastic_alphas <- seq(0, 1, by = 0.1)
+
+# Search Grid
+search_grid <- expand.grid(.alpha = elastic_alphas, .lambda = elastic_lambdas)
+
+# Train Config for Elastic Net
+train_control_config_elastic <- trainControl(method = "repeatedcv", 
+                                            number = 10, 
+                                            repeats = 3)
+
+# Elastic Model 
+elastic_cv_fit <- train(SalePrice ~ ., data = train_split, 
+                        method = "glmnet", 
+                        tuneGrid = search_grid, 
+                        metric = "RMSE",
+                        preProc = c("center", "scale"),
+                        trControl = train_control_config_elastic)
+# Inspect Model
+attributes(elastic_cv_fit)
+
+# Obtain best tuning parameters
+elastic_cv_fit$bestTune
+
+# Coffecients 
+elastic_cv_mod <- elastic_cv_fit$finalModel
+elastic_features_used <- coef(elastic_cv_fit, s = elastic_cv_fit$bestTune$lambda)
+
+# Final Model
+elastic_mod <- glmnet(x = data.matrix(train_split[, !"SalePrice", with = F]), y = train_split$SalePrice,
+                    alpha = elastic_cv_fit$bestTune$alpha, lambda = elastic_cv_fit$bestTune$lambda)
+
+# Prediction based on best lambda
+elasitc_pred <- predict(elastic_mod, s = elastic_cv_fit$bestTune$lambda, data.matrix(validation_split[, !"SalePrice", with = F]))
+
+# Save RMSE
+elastic_RMSE <- sqrt(mean((elasitc_pred - validation_split$SalePrice)^2))
+
+# Print Results
+paste("Elastic Net Linear Regression RMSE = ", elastic_RMSE)
+
+```
+
+## Selection of Features
+In this section we will compare all the selected features from all models and try to optimize our prediction. We will foucs on using a Lasso model for the final prediction.
+
+```{r Feature Selection}
+# ---- Feature Selection ----
+# Analysis of Full LM Model
+# stat_full_lm <- summary(full_lm_mod)
+# stat_full_lm$coefficients
+# Some p-values high, suggest variable not important.
+
+### Find important features to use in model also to make polynomials 
+# Chi-squared
+chi_weights[order(chi_weights$attr_importance, decreasing = TRUE), ][1]
+# Fetures that based threshold
+chi_squared_features
+
+# Information gain
+info_gain_weights[order(info_gain_weights$attr_importance, decreasing = TRUE),][1]
+# Fetures that based threshold
+info_gain_features
+
+# Forward Stepwise
+# paste("Features Selected" , forward_lm_mod$finalModel$formula[3])
+# OverallQual + TotalSF + Neighborhood + OverallCond + BsmtFinType1 + GarageScore + LotArea +
+# HouseAge + RelativeSize + SaleCondition + KitchenQual + BsmtFinSF1 + MSZoning + Heating + Functional
+
+# Ridge Regression
+ridge_features_used
+
+# Lasso Regression
+lasso_features_used
+
+# ElasticNet Regression
+elastic_features_used
+
+# Selected Features -> unique from chi and info gain
+selected_features <- unique(c(chi_squared_features, info_gain_features))
+selected_features
+
+# New Lasso Regeression
+# Set lambda setting
+lasso_lambdas <- 10^seq(-3, 3, by = .1)
+
+# Model
+lasso_mod_sel_feat <- glmnet(x = data.matrix(train_split[, selected_features, with = F]), y = train_split$SalePrice,
+                             alpha = 1, lambda = lasso_lambdas)
+
+# Cross-validation based model with selected features
+lasso_cv_fit_sel_feat <- cv.glmnet(x = data.matrix(train_split[, selected_features, with = F]), y = train_split$SalePrice,
+                          alpha = 1, lambda = lasso_lambdas)
+# Plot Model
+plot(lasso_cv_fit_sel_feat)
+
+# Lambda Selection
+lasso_sel_feat_lam <- lasso_cv_fit_sel_feat$lambda.min
+paste("Best Lambda value from CV=", lasso_sel_feat_lam)
+
+# Prediction based on best lambda
+lasso_sel_feat_pred <- predict(lasso_mod_sel_feat, s = lasso_sel_feat_lam, data.matrix(validation_split[, selected_features, with = F]))
+
+# Save RMSE
+lasso_sel_feat_RMSE <- sqrt(mean((lasso_sel_feat_lam - validation_split$SalePrice)^2))
+
+# Print results
+paste("RMSE for lambda ", lasso_sel_feat_lam, " = ", lasso_sel_feat_RMSE)
+
+```
+
+## Prediction Test Data
+In this section we will conduct prediction on the test data and write a csv file with our values.
+```{r Prediction of Test Data & Submission}
+# ---- Prediction on Test Data ----
+# Prediction on Test Data with chosen model (in log)
+# Due to error. lasso model with selected featured did not work. therefore lasso model will be used as last attempt
+lasso_test_prediction <- predict(lasso_mod, s = lasso_best_lam, newx = data.matrix(dt_test[, !"Id", with = F]))
+
+# Analysis of predictions
+summary(lasso_test_prediction)
+summary(info_gain_lm_mod_pred)
+summary(lasso_pred_best_lam)
+
+# Actual Sales Price (de-log with exp)
+test_pred <- exp(lasso_test_prediction)-1
+validation_pred <- exp(lasso_pred_best_lam)-1
+train_values <- exp(dt_train$SalePrice)-1
+
+# Analysis of predictions
+summary(test_pred)
+summary(validation_pred)
+summary(train_values)
+# Plot histogram of predictions
+
+# Plot Distrubution
+hist(test_pred)
+hist(validation_pred)
+hist(train_values)
+
+View(test_pred)
+#hist(exp(dt_train$SalePrice)-1)
+
+# ---- Submission -----
+# Save ID and SalePrice 
+submit <- data.frame(Id = dt_test$Id, SalePrice = test_pred)
+#  Name columns
+colnames(submit) <-c("Id", "SalePrice")
+
+# Set all failed predictions (NAs) to zero
+submit$SalePrice[is.na(submit$SalePrice)] <- 0
+# Calculate replacement value for NAs now set to zero -> sum of saleprice / (nr of rows - nr of NAs)
+replace_value_for_na <- sum(na.omit(submit$SalePrice))/(nrow(submit) - sum(submit$SalePrice == 0))
+submit$SalePrice[submit$SalePrice == 0] <- replace_value_for_na
+
+summary(submit$SalePrice)
+
+# Write to file
+write.csv(submit,file="lasso_final.csv", row.names=F)
+```
