@@ -11,17 +11,18 @@ on the dataset and the competition see
 <https://www.kaggle.com/c/house-prices-advanced-regression-techniques>.
 
 ## Project Goal
-
-  - Predict the final price of each home with the lowest RMSE score
-    possible by novel feature engineering and general linear regression
-    models inc. Ridge, Lasso and ElasticNet model techniques.
+Predict the final price of each home with the lowest RMSE score
+possible by novel feature engineering and general linear regression
+models inc. Ridge, Lasso and ElasticNet model techniques.
 
 ## Data Ingestion & Cleaning
 
 In this section we will ingest, inspect and clean data. Cleaning process
-includes: 1) Dropping uninformative features  
-2\) Refactorize known features 3) Dropping low level features 4) NA
-imputation -\> by using data description notes, data analysis and LM for
+includes: 
+1. Dropping uninformative features  
+2. Refactorize known features 
+3. Dropping low level features 
+4. NA imputation -> by using data description notes, data analysis and LM for
 prediction.
 
 ``` r
@@ -2292,12 +2293,11 @@ dt_train <- dt_train[!c(GrLivArea > 4000)]
 
 ## Feature Creation
 
-In this section we will create new features by transforming and adding
-exisiting features: 1) Oridinal transformation -\> impute numeric range
-for ordinal categorical features. 2) Simplified transformation -\> lower
-the number of levels of selected categorical values. 3) New feautres -\>
-by adding and modify existing features together. 4) Aggereate features
--\> group features and compute a aggreated score.
+In this section we will create new features by transforming and adding exisiting features: 
+1. Oridinal transformation -> impute numeric range for ordinal categorical features.
+2. Simplified transformation -> lower the number of levels of selected categorical values.
+3. New feautres -> by adding and modify existing features together. 
+4. Aggereate features -> group features and compute a aggreated score.
 
 ``` r
 # ---- Ordinal Feature Creation  ----
@@ -2755,7 +2755,7 @@ sort(sapply(lapply(na.omit(dt_test[, test_factor_columns, with = F]), droplevels
 In this section we train a simple linear regression model with all
 features. The RMSE from our prediction will act as baseline to see if
 our model type and feature selection is better or
-wrose.
+worse.
 
 ``` r
 ### Full Model - lm model with all features - to evaluate the impact of the feature engineering
